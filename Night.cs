@@ -12,6 +12,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -210,6 +211,10 @@ namespace Night
             bad += Eq(sb, "max-v", veil, Look.MaxVeil);
             bad += Eq(sb, "ch-half", Look.Channel(0.5, Look.Red), 0.86);
             bad += Eq(sb, "ch-full", Look.Channel(1, Look.Red), Look.Red);
+            bad += Flag(sb, "cover-full", ScreenWatch.Covers(0, 0, 1920, 1080, 0, 0, 1920, 1080), true);
+            bad += Flag(sb, "cover-taskbar", ScreenWatch.Covers(0, 0, 1920, 1040, 0, 0, 1920, 1080), false);
+            bad += Flag(sb, "cover-slack", ScreenWatch.Covers(0, 0, 1914, 1074, 0, 0, 1920, 1080), true);
+            bad += Flag(sb, "cover-small", ScreenWatch.Covers(10, 10, 800, 600, 0, 0, 1920, 1080), false);
 
             ushort[] liked = Gamma.Ramp(1);
             ushort[] plain = Gamma.Ramp(0);
@@ -264,6 +269,15 @@ namespace Night
                 .Append(" expect=").Append(expect).Append('\n');
             return ok ? 0 : 1;
         }
+
+        static int Flag(StringBuilder sb, string name, bool got, bool expect)
+        {
+            bool ok = got == expect;
+            sb.Append(ok ? "ok   " : "FAIL ").Append(name)
+                .Append(" got=").Append(got ? "1" : "0")
+                .Append(" expect=").Append(expect ? "1" : "0").Append('\n');
+            return ok ? 0 : 1;
+        }
     }
 
     static class Look
@@ -298,10 +312,78 @@ namespace Night
         }
     }
 
+    static class ScreenWatch
+    {
+        const int DwmCloaked = 14;
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetDesktopWindow();
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetShellWindow();
+
+        [DllImport("user32.dll")]
+        static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+        [DllImport("dwmapi.dll")]
+        static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
+
+        struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        public static bool Covers(int left, int top, int right, int bottom, int sl, int st, int sr, int sb)
+        {
+            int ww = right - left;
+            int wh = bottom - top;
+            int sw = sr - sl;
+            int sh = sb - st;
+            if (sw < 20 || sh < 20 || ww < 20 || wh < 20) return false;
+            return ww >= sw - 8 && wh >= sh - 8;
+        }
+
+        public static bool IsForeignFullscreen()
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return false;
+            if (hwnd == GetDesktopWindow() || hwnd == GetShellWindow()) return false;
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0 || pid == (uint)Process.GetCurrentProcess().Id) return false;
+            int cloaked;
+            if (DwmGetWindowAttribute(hwnd, DwmCloaked, out cloaked, 4) == 0 && cloaked != 0) return false;
+            RECT rect;
+            if (!GetWindowRect(hwnd, out rect)) return false;
+            int cx = rect.Left + (rect.Right - rect.Left) / 2;
+            int cy = rect.Top + (rect.Bottom - rect.Top) / 2;
+            Screen[] screens = Screen.AllScreens;
+            if (screens == null) return false;
+            foreach (Screen s in screens)
+            {
+                Rectangle b = s.Bounds;
+                bool inside = b.Contains(cx, cy) || b.Contains(rect.Left + 1, rect.Top + 1);
+                if (!inside) continue;
+                if (Covers(rect.Left, rect.Top, rect.Right, rect.Bottom, b.Left, b.Top, b.Right, b.Bottom)) return true;
+            }
+            return false;
+        }
+    }
+
     sealed class Config
     {
         public int Dim = Look.Liked;
         public bool Autostart;
+        public bool ReleaseFullscreen = true;
 
         public static string FilePath()
         {
@@ -325,6 +407,7 @@ namespace Night
                     string v = line.Substring(eq + 1).Trim();
                     if (k == "dim") c.Dim = Clamp(Parse(v, c.Dim), 0, 100);
                     else if (k == "autostart") c.Autostart = v == "1";
+                    else if (k == "release") c.ReleaseFullscreen = v == "1";
                 }
             }
             catch { }
@@ -338,6 +421,7 @@ namespace Night
             StringBuilder sb = new StringBuilder();
             sb.Append("dim=").Append(Dim).Append('\n');
             sb.Append("autostart=").Append(Autostart ? "1" : "0").Append('\n');
+            sb.Append("release=").Append(ReleaseFullscreen ? "1" : "0").Append('\n');
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
             File.Copy(tmp, path, true);
@@ -651,6 +735,15 @@ namespace Night
         DateTime _lastSave = DateTime.MinValue;
         DateTime _appliedAt = DateTime.MinValue;
         DateTime _pauseUntil = DateTime.MinValue;
+        bool _heldOff;
+        bool _fsHold;
+        int _fsStreak;
+        bool _keysOn;
+
+        const int WmHotkey = 0x0312;
+        const int HkUp = 1;
+        const int HkDown = 2;
+        const int HkToggle = 3;
 
         NotifyIcon _tray;
         Icon _icon;
@@ -659,10 +752,12 @@ namespace Night
         Label _value;
         Label _status;
         CheckBox _auto;
+        CheckBox _release;
         LinkLabel _pause;
         ToolStripMenuItem _miLevel;
         ToolStripMenuItem _miPause;
         ToolStripMenuItem _miStart;
+        ToolStripMenuItem _miRelease;
         List<Veil> _veils = new List<Veil>();
         string _veilKey = "";
 
@@ -686,7 +781,7 @@ namespace Night
             MaximizeBox = false;
             MinimizeBox = true;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(420, 312);
+            ClientSize = new Size(420, 368);
             BackColor = Bg;
             ForeColor = Fg;
             ShowInTaskbar = openWindow;
@@ -713,8 +808,46 @@ namespace Night
             _timer.Interval = 400;
             _timer.Tick += OnTick;
             _timer.Start();
+            RegisterKeys();
             ApplyNow(true);
             RefreshTexts();
+        }
+
+        [DllImport("user32.dll")]
+        static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint key);
+
+        [DllImport("user32.dll")]
+        static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        void RegisterKeys()
+        {
+            uint mod = 0x0001 | 0x0002 | 0x4000;
+            IntPtr handle = Handle;
+            bool up = RegisterHotKey(handle, HkUp, mod, 0x26);
+            bool down = RegisterHotKey(handle, HkDown, mod, 0x28);
+            bool toggle = RegisterHotKey(handle, HkToggle, mod, 0x4E);
+            _keysOn = up || down || toggle;
+        }
+
+        void UnregisterKeys()
+        {
+            if (!_keysOn || !IsHandleCreated) return;
+            UnregisterHotKey(Handle, HkUp);
+            UnregisterHotKey(Handle, HkDown);
+            UnregisterHotKey(Handle, HkToggle);
+            _keysOn = false;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmHotkey)
+            {
+                int id = m.WParam.ToInt32();
+                if (id == HkUp) Nudge(-5);
+                else if (id == HkDown) Nudge(5);
+                else if (id == HkToggle) ToggleHold();
+            }
+            base.WndProc(ref m);
         }
 
         protected override void SetVisibleCore(bool value)
@@ -769,6 +902,7 @@ namespace Night
         {
             if (disposing)
             {
+                UnregisterKeys();
                 if (_timer != null) _timer.Stop();
                 try { SystemEvents.DisplaySettingsChanged -= OnDisplay; } catch { }
                 try { SystemEvents.SessionSwitch -= OnSession; } catch { }
@@ -862,8 +996,24 @@ namespace Night
             _auto.CheckedChanged += OnAuto;
             Controls.Add(_auto);
 
-            L("Крестик прячет в трей.", 20, 282, 220, 22, Muted, 9f, false);
-            LinkLabel exit = Link("Выйти", 320, 280, 80);
+            _release = new CheckBox();
+            _release.Text = "В полном экране обычная картинка";
+            _release.Left = 20;
+            _release.Top = 276;
+            _release.AutoSize = true;
+            _release.ForeColor = Fg;
+            _release.BackColor = Bg;
+            _release.FlatStyle = FlatStyle.Flat;
+            _release.FlatAppearance.BorderSize = 0;
+            _release.FlatAppearance.CheckedBackColor = Bg;
+            _release.FlatAppearance.MouseOverBackColor = Color.FromArgb(40, 40, 44);
+            _release.Checked = _config.ReleaseFullscreen;
+            _release.CheckedChanged += OnRelease;
+            Controls.Add(_release);
+
+            L("Ctrl+Alt+N — обычный экран. Ctrl+Alt+стрелки — тусклость.", 20, 306, 380, 20, Muted, 8.5f, false);
+            L("Крестик прячет в трей.", 20, 334, 220, 22, Muted, 9f, false);
+            LinkLabel exit = Link("Выйти", 320, 332, 80);
             exit.TextAlign = ContentAlignment.MiddleRight;
             exit.Click += delegate { ExitClean(); };
         }
@@ -897,6 +1047,8 @@ namespace Night
             _miPause.Click += delegate { TogglePause(); };
             _miStart = new ToolStripMenuItem("Запускать вместе с Windows");
             _miStart.Click += delegate { _auto.Checked = !_auto.Checked; };
+            _miRelease = new ToolStripMenuItem("В полном экране обычная картинка");
+            _miRelease.Click += delegate { _release.Checked = !_release.Checked; };
             ToolStripMenuItem exit = new ToolStripMenuItem("Выйти");
             exit.Click += delegate { ExitClean(); };
 
@@ -909,6 +1061,7 @@ namespace Night
             menu.Items.Add(off);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_miPause);
+            menu.Items.Add(_miRelease);
             menu.Items.Add(_miStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exit);
@@ -957,6 +1110,7 @@ namespace Night
             if (_loading) return;
             _dim = _bar.Value;
             _pauseUntil = DateTime.MinValue;
+            _heldOff = false;
             _dirty = true;
             ApplyNow(true);
             RefreshTexts();
@@ -997,8 +1151,51 @@ namespace Night
         {
             if (_pauseUntil > DateTime.Now) _pauseUntil = DateTime.MinValue;
             else _pauseUntil = DateTime.Now.AddHours(1);
+            _heldOff = false;
             ApplyNow(true);
             RefreshTexts();
+        }
+
+        void ToggleHold()
+        {
+            _heldOff = !_heldOff;
+            _pauseUntil = DateTime.MinValue;
+            ApplyNow(true);
+            RefreshTexts();
+        }
+
+        void OnRelease(object sender, EventArgs e)
+        {
+            if (_loading) return;
+            _config.ReleaseFullscreen = _release.Checked;
+            _dirty = true;
+            if (!_release.Checked)
+            {
+                _fsHold = false;
+                _fsStreak = 0;
+            }
+            ApplyNow(true);
+            RefreshTexts();
+        }
+
+        void PollFullscreen()
+        {
+            if (!_config.ReleaseFullscreen)
+            {
+                _fsStreak = 0;
+                _fsHold = false;
+                return;
+            }
+            bool fs = false;
+            try { fs = ScreenWatch.IsForeignFullscreen(); }
+            catch { fs = false; }
+            if (fs)
+            {
+                if (_fsStreak < 4) _fsStreak++;
+            }
+            else if (_fsStreak > -4) _fsStreak--;
+            if (_fsStreak >= 2) _fsHold = true;
+            else if (_fsStreak <= -2) _fsHold = false;
         }
 
         void OnTick(object sender, EventArgs e)
@@ -1008,8 +1205,10 @@ namespace Night
             try
             {
                 SaveIfDirty();
-                bool force = _force != 0;
-                if (force) _force = 0;
+                bool wasFs = _fsHold;
+                PollFullscreen();
+                bool force = _force != 0 || wasFs != _fsHold;
+                if (_force != 0) _force = 0;
                 ApplyNow(force);
                 RefreshTexts();
             }
@@ -1031,6 +1230,7 @@ namespace Night
         {
             _config.Dim = _dim;
             _config.Autostart = _auto.Checked;
+            _config.ReleaseFullscreen = _release.Checked;
             try { _config.Save(); } catch { }
             _dirty = false;
             _lastSave = DateTime.Now;
@@ -1048,6 +1248,8 @@ namespace Night
         int EffectiveDim()
         {
             if (_pauseUntil > DateTime.Now) return 0;
+            if (_heldOff) return 0;
+            if (_fsHold) return 0;
             return _dim;
         }
 
@@ -1156,6 +1358,15 @@ namespace Night
             {
                 text = "До " + _pauseUntil.ToString("HH:mm") + " экран обычный.";
             }
+            else if (_heldOff)
+            {
+                text = "Обычный экран. Ctrl+Alt+N вернёт тёплый.";
+            }
+            else if (_fsHold)
+            {
+                text = "На экране программа во весь монитор. Свернёшь — вернётся тёплый.";
+                col = Accent;
+            }
             else if (!_gammaOk && _dim > 0)
             {
                 text = "Драйвер не взял гамму, держу только плёнку. Тепла нет.";
@@ -1189,11 +1400,16 @@ namespace Night
                 _miPause.Text = pauseText;
                 _miPause.Checked = paused;
                 _miStart.Checked = _auto.Checked;
+                _miRelease.Checked = _release.Checked;
                 string level = "Тусклость: " + _dim;
                 if (_miLevel.Text != level) _miLevel.Text = level;
             }
 
-            string tip = paused ? "Ночник — обычный до " + _pauseUntil.ToString("HH:mm") : "Ночник — тусклость " + _dim;
+            string tip;
+            if (paused) tip = "Ночник — обычный до " + _pauseUntil.ToString("HH:mm");
+            else if (_heldOff) tip = "Ночник — обычный экран";
+            else if (_fsHold) tip = "Ночник — полный экран, обычная картинка";
+            else tip = "Ночник — тусклость " + _dim;
             if (tip.Length > 63) tip = tip.Substring(0, 63);
             if (_tray != null && _tray.Text != tip) _tray.Text = tip;
         }
